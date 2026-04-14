@@ -1,7 +1,3 @@
-# 🛍️ Amazon Reviews — Sentiment Analysis
-## From Classical ML Baselines to Deep Learning
-
----
 
 ### 📌 Project Overview
 
