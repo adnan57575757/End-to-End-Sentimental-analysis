@@ -1,470 +1,141 @@
-# End-to-End-Sentimental-analysis
-"""
-Amazon Reviews Sentiment Analysis — FastAPI Backend
-Run: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
-"""
-
-import os
-import json
-import time
-import numpy as np
-from pathlib import Path
-from typing import List, Optional
-
-import tensorflow as tf
-from tensorflow.keras.preprocessing.text import tokenizer_from_json  # type: ignore
-from tensorflow.keras.preprocessing.sequence import pad_sequences      # type: ignore
-
-from fastapi import FastAPI, HTTPException  # type: ignore
-from fastapi.middleware.cors import CORSMiddleware  # type: ignore
-from fastapi.staticfiles import StaticFiles  # type: ignore
-from fastapi.responses import FileResponse  # type: ignore
-from pydantic import BaseModel, field_validator  # pydantic v2
-
-# ── Paths ────────────────────────────────────────────────────
-#  Structure on disk:
-#  deployment/
-#  ├── app.py
-#  └── models/
-#      ├── best_model_final.keras
-#      ├── model_meta.json
-#      ├── tokenizer_config.json
-#      └── static/
-#          └── index.html
-
-BASE_DIR = Path(__file__).resolve().parent  
-MODEL_PATH = BASE_DIR / "models" / "best_model_final.keras"
-TOK_PATH   = BASE_DIR / "models" /"tokenizer_config.json"
-META_PATH  = BASE_DIR /"models" / "model_meta.json"
-
-STATIC_DIR = BASE_DIR / "static"
-
-# ── Validate paths before loading ────────────────────────────
-for p in [MODEL_PATH, TOK_PATH, META_PATH, STATIC_DIR]:
-    if not p.exists():
-        raise FileNotFoundError(f"Required path not found: {p}")
-
-# ── Load model & tokeniser on startup ────────────────────────
-print("Loading model & tokeniser ...")
-
-with open(META_PATH, encoding="utf-8") as f:
-    META = json.load(f)
-
-with open(TOK_PATH, encoding="utf-8") as f:
-    TOKENIZER = tokenizer_from_json(f.read())
-
-MODEL = tf.keras.models.load_model(str(MODEL_PATH))
-
-# Warm-up (first predict triggers XLA compilation)
-_dummy = pad_sequences([[1, 2, 3]], maxlen=META["max_len"], padding="post")
-MODEL.predict(_dummy, verbose=0)
-
-print(
-    f"Model loaded  : {META['best_model_name']}\n"
-    f"Accuracy      : {META['test_accuracy']:.4f}\n"
-    f"ROC-AUC       : {META['test_roc_auc']:.4f}"
-)
-
-# ── FastAPI app ───────────────────────────────────────────────
-app = FastAPI(
-    title="Amazon Sentiment API",
-    description="Deep Learning sentiment analysis on Amazon reviews",
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ── Pydantic schemas (pydantic v2) ────────────────────────────
-class TextInput(BaseModel):
-    text: str
-
-    @field_validator("text")
-    @classmethod
-    def not_empty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("text must not be empty")
-        return v
-
-
-class BatchInput(BaseModel):
-    texts: List[str]
-
-    @field_validator("texts")
-    @classmethod
-    def validate_texts(cls, v: List[str]) -> List[str]:
-        cleaned = [t.strip() for t in v if t.strip()]
-        if not cleaned:
-            raise ValueError("texts list must not be empty")
-        if len(cleaned) > 50:
-            raise ValueError("maximum 50 texts per batch")
-        return cleaned
-
-
-# latency_ms is Optional — added after _predict() returns
-class PredictionResult(BaseModel):
-    text: str
-    label: str
-    confidence: float
-    score: float
-    latency_ms: Optional[float] = None
-
-
-# ── Core inference ────────────────────────────────────────────
-def _predict(texts: List[str]) -> List[dict]:
-    seqs  = TOKENIZER.texts_to_sequences(texts)
-    pads  = pad_sequences(seqs, maxlen=META["max_len"],
-                          padding="post", truncating="post")
-    probs = MODEL.predict(pads, verbose=0).flatten().tolist()
-
-    results = []
-    for txt, prob in zip(texts, probs):
-        label = "Positive" if prob >= 0.5 else "Negative"
-        conf  = prob if prob >= 0.5 else 1.0 - prob
-        results.append({
-            "text":       txt,
-            "label":      label,
-            "confidence": round(conf, 4),
-            "score":      round(prob, 4),
-        })
-    return results
-
-
-# ── API Routes  (must be declared BEFORE app.mount) ──────────
-@app.get("/api/health")
-def health():
-    return {
-        "status":   "ok",
-        "model":    META["best_model_name"],
-        "accuracy": META["test_accuracy"],
-        "auc":      META["test_roc_auc"],
-    }
-
-
-@app.get("/api/model-info")
-def model_info():
-    return {
-        "model_name":    META["best_model_name"],
-        "test_accuracy": META["test_accuracy"],
-        "test_roc_auc":  META["test_roc_auc"],
-        "vocab_size":    META["vocab_size"],
-        "max_len":       META["max_len"],
-        "embed_dim":     META["embed_dim"],
-        "dl_samples":    META["dl_samples"],
-        "all_results":   META.get("all_results", {}),
-    }
-
-
-@app.post("/api/predict", response_model=PredictionResult)
-def predict(body: TextInput):
-    t0  = time.perf_counter()
-    res = _predict([body.text])[0]
-    res["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-    return res
-
-
-@app.post("/api/predict/batch")
-def predict_batch(body: BatchInput):
-    t0      = time.perf_counter()
-    results = _predict(body.texts)
-    elapsed = round((time.perf_counter() - t0) * 1000, 1)
-    return {
-        "results":    results,
-        "count":      len(results),
-        "latency_ms": elapsed,
-    }
-
-
-# ── Static files (AFTER API routes) ──────────────────────────
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-
-@app.get("/{full_path:path}")
-def catch_all(full_path: str):
-    """SPA fallback — serve index.html for every non-API path."""
-    return FileResponse(str(STATIC_DIR / "index.html"))
-
-
-# ── Entry point ───────────────────────────────────────────────
-if __name__ == "__main__":
-    import uvicorn      # type: ignore
-    import webbrowser
-    import threading
-    import socket
-
-    PORT = 8000
-
-    def get_local_ip():
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
-
-    local_ip = get_local_ip()
-
-    def print_links():
-        import time
-        time.sleep(1.5)
-        print("\n" + "=" * 55)
-        print("  SentimentAI is running!")
-        print("=" * 55)
-        print(f"  Local    ->  http://localhost:{PORT}")
-        print(f"  Network  ->  http://{local_ip}:{PORT}")
-        print(f"  API Docs ->  http://localhost:{PORT}/docs")
-        print("=" * 55 + "\n")
-
-    threading.Thread(target=print_links, daemon=True).start()
-
-    def open_browser():
-        import time
-        time.sleep(2)
-        webbrowser.open(f"http://localhost:{PORT}")
-
-    threading.Thread(target=open_browser, daemon=True).start()
-
-    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
-
-    """
-Amazon Reviews Sentiment Analysis — FastAPI Backend
-Run: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
-"""
-
-import os
-import json
-import time
-import numpy as np
-from pathlib import Path
-from typing import List, Optional
-
-import tensorflow as tf
-from tensorflow.keras.preprocessing.text import tokenizer_from_json  # type: ignore
-from tensorflow.keras.preprocessing.sequence import pad_sequences      # type: ignore
-
-from fastapi import FastAPI, HTTPException  # type: ignore
-from fastapi.middleware.cors import CORSMiddleware  # type: ignore
-from fastapi.staticfiles import StaticFiles  # type: ignore
-from fastapi.responses import FileResponse  # type: ignore
-from pydantic import BaseModel, field_validator  # pydantic v2
-
-# ── Paths ────────────────────────────────────────────────────
-#  Structure on disk:
-#  deployment/
-#  ├── app.py
-#  └── models/
-#      ├── best_model_final.keras
-#      ├── model_meta.json
-#      ├── tokenizer_config.json
-#      └── static/
-#          └── index.html
-
-BASE_DIR = Path(__file__).resolve().parent  
-MODEL_PATH = BASE_DIR / "models" / "best_model_final.keras"
-TOK_PATH   = BASE_DIR / "models" /"tokenizer_config.json"
-META_PATH  = BASE_DIR /"models" / "model_meta.json"
-
-STATIC_DIR = BASE_DIR / "static"
-
-# ── Validate paths before loading ────────────────────────────
-for p in [MODEL_PATH, TOK_PATH, META_PATH, STATIC_DIR]:
-    if not p.exists():
-        raise FileNotFoundError(f"Required path not found: {p}")
-
-# ── Load model & tokeniser on startup ────────────────────────
-print("Loading model & tokeniser ...")
-
-with open(META_PATH, encoding="utf-8") as f:
-    META = json.load(f)
-
-with open(TOK_PATH, encoding="utf-8") as f:
-    TOKENIZER = tokenizer_from_json(f.read())
-
-MODEL = tf.keras.models.load_model(str(MODEL_PATH))
-
-# Warm-up (first predict triggers XLA compilation)
-_dummy = pad_sequences([[1, 2, 3]], maxlen=META["max_len"], padding="post")
-MODEL.predict(_dummy, verbose=0)
-
-print(
-    f"Model loaded  : {META['best_model_name']}\n"
-    f"Accuracy      : {META['test_accuracy']:.4f}\n"
-    f"ROC-AUC       : {META['test_roc_auc']:.4f}"
-)
-
-# ── FastAPI app ───────────────────────────────────────────────
-app = FastAPI(
-    title="Amazon Sentiment API",
-    description="Deep Learning sentiment analysis on Amazon reviews",
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ── Pydantic schemas (pydantic v2) ────────────────────────────
-class TextInput(BaseModel):
-    text: str
-
-    @field_validator("text")
-    @classmethod
-    def not_empty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("text must not be empty")
-        return v
-
-
-class BatchInput(BaseModel):
-    texts: List[str]
-
-    @field_validator("texts")
-    @classmethod
-    def validate_texts(cls, v: List[str]) -> List[str]:
-        cleaned = [t.strip() for t in v if t.strip()]
-        if not cleaned:
-            raise ValueError("texts list must not be empty")
-        if len(cleaned) > 50:
-            raise ValueError("maximum 50 texts per batch")
-        return cleaned
-
-
-# latency_ms is Optional — added after _predict() returns
-class PredictionResult(BaseModel):
-    text: str
-    label: str
-    confidence: float
-    score: float
-    latency_ms: Optional[float] = None
-
-
-# ── Core inference ────────────────────────────────────────────
-def _predict(texts: List[str]) -> List[dict]:
-    seqs  = TOKENIZER.texts_to_sequences(texts)
-    pads  = pad_sequences(seqs, maxlen=META["max_len"],
-                          padding="post", truncating="post")
-    probs = MODEL.predict(pads, verbose=0).flatten().tolist()
-
-    results = []
-    for txt, prob in zip(texts, probs):
-        label = "Positive" if prob >= 0.5 else "Negative"
-        conf  = prob if prob >= 0.5 else 1.0 - prob
-        results.append({
-            "text":       txt,
-            "label":      label,
-            "confidence": round(conf, 4),
-            "score":      round(prob, 4),
-        })
-    return results
-
-
-# ── API Routes  (must be declared BEFORE app.mount) ──────────
-@app.get("/api/health")
-def health():
-    return {
-        "status":   "ok",
-        "model":    META["best_model_name"],
-        "accuracy": META["test_accuracy"],
-        "auc":      META["test_roc_auc"],
-    }
-
-
-@app.get("/api/model-info")
-def model_info():
-    return {
-        "model_name":    META["best_model_name"],
-        "test_accuracy": META["test_accuracy"],
-        "test_roc_auc":  META["test_roc_auc"],
-        "vocab_size":    META["vocab_size"],
-        "max_len":       META["max_len"],
-        "embed_dim":     META["embed_dim"],
-        "dl_samples":    META["dl_samples"],
-        "all_results":   META.get("all_results", {}),
-    }
-
-
-@app.post("/api/predict", response_model=PredictionResult)
-def predict(body: TextInput):
-    t0  = time.perf_counter()
-    res = _predict([body.text])[0]
-    res["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-    return res
-
-
-@app.post("/api/predict/batch")
-def predict_batch(body: BatchInput):
-    t0      = time.perf_counter()
-    results = _predict(body.texts)
-    elapsed = round((time.perf_counter() - t0) * 1000, 1)
-    return {
-        "results":    results,
-        "count":      len(results),
-        "latency_ms": elapsed,
-    }
-
-
-# ── Static files (AFTER API routes) ──────────────────────────
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-
-@app.get("/{full_path:path}")
-def catch_all(full_path: str):
-    """SPA fallback — serve index.html for every non-API path."""
-    return FileResponse(str(STATIC_DIR / "index.html"))
-
-
-# ── Entry point ───────────────────────────────────────────────
-if __name__ == "__main__":
-    import uvicorn      # type: ignore
-    import webbrowser
-    import threading
-    import socket
-
-    PORT = 8000
-
-    def get_local_ip():
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
-
-    local_ip = get_local_ip()
-
-    def print_links():
-        import time
-        time.sleep(1.5)
-        print("\n" + "=" * 55)
-        print("  SentimentAI is running!")
-        print("=" * 55)
-        print(f"  Local    ->  http://localhost:{PORT}")
-        print(f"  Network  ->  http://{local_ip}:{PORT}")
-        print(f"  API Docs ->  http://localhost:{PORT}/docs")
-        print("=" * 55 + "\n")
-
-    threading.Thread(target=print_links, daemon=True).start()
-
-    def open_browser():
-        import time
-        time.sleep(2)
-        webbrowser.open(f"http://localhost:{PORT}")
-
-    threading.Thread(target=open_browser, daemon=True).start()
-
-    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
+# 🛍️ Amazon Reviews — Sentiment Analysis
+## From Classical ML Baselines to Deep Learning
+
+---
+
+### 📌 Project Overview
+
+This notebook presents a complete end-to-end **Sentiment Analysis** pipeline applied to the **Amazon Customer Reviews** dataset.  
+The goal is to classify each review as either **Positive** or **Negative** using both classical Machine Learning and modern Deep Learning approaches.
+
+---
+
+### 📦 Dataset
+
+| Property | Value |
+|---|---|
+| Source | [Amazon Reviews for Sentiment Analysis](https://www.kaggle.com/datasets/bittlingmayer/amazonreviews) |
+| Format | FastText (bz2 compressed) |
+| Training set | **3,600,000** reviews |
+| Test set | **400,000** reviews |
+| Classes | `__label__1` → Negative (0) · `__label__2` → Positive (1) |
+| Balance | Perfectly balanced (50 / 50) |
+
+---
+
+### 🗺️ Pipeline Structure
+
+```
+Raw .bz2 Files
+      │
+      ▼
+ Data Loading & EDA
+      │
+      ├──► ML Baseline (TF-IDF + Logistic Regression / LinearSVC)
+      │
+      └──► DL Pipeline
+                │
+                ├── Stratified Sampling (1.2M from 3.6M)
+                ├── Tokenisation & Padding
+                ├── Model Training (BiLSTM · BiGRU · Conv1D+BiLSTM)
+                ├── Evaluation on 400K test set
+                └── Save Best Model + Tokeniser
+```
+
+---
+
+### 🏗️ Models Trained
+
+| # | Model | Type | Key Feature |
+|---|---|---|---|
+| 1 | Logistic Regression | ML | TF-IDF unigrams + bigrams |
+| 2 | Linear SVM | ML | TF-IDF unigrams + bigrams |
+| 3 | **BiLSTM** | Deep Learning | Bidirectional LSTM + GlobalMaxPool |
+| 4 | **BiGRU** | Deep Learning | Bidirectional GRU + GlobalMaxPool |
+| 5 | **Conv1D + BiLSTM** | Deep Learning | CNN n-gram features → BiLSTM context |
+
+---
+
+### ⚙️ Key Design Decisions
+
+- **No data leakage** — tokeniser is fitted on training texts only; `test_df` is never seen during training  
+- **Stratified sampling** — 600K per class from `train_df` to keep balance  
+- **Large batch size (1024)** — critical for GPU efficiency; original batch of 8 made training 128× slower  
+- **Bidirectional RNNs** — read sequences forward *and* backward for richer context  
+- **GlobalMaxPooling** — captures the most salient feature across all timesteps, better than last hidden state  
+- **SpatialDropout1D** — drops entire embedding channels (better than random dropout for sequences)
+
+---
+
+## Results at a Glance
+
+| Model | Type | Accuracy | ROC-AUC | Notes |
+|---|---|---|---|---|
+| Logistic Regression | ML | ~90.6% | ~0.966 | Fast, strong baseline |
+| Linear SVM | ML | ~90.3% | N/A | Slightly below LGR |
+| BiLSTM | Deep Learning | ~94.2% | ~0.983 | Strong sequential model |
+| BiGRU | Deep Learning | ~94.4% | ~0.984 | GRU = faster BiLSTM alternative |
+| **Conv1D + BiLSTM** | **Deep Learning** | **~94.6%** | **~0.986** | **🏆 Best overall** |
+
+---
+
+## Key Findings
+
+### 1. DL consistently outperforms classical ML
+All three deep learning models exceeded 94% accuracy, beating the TF-IDF baselines  
+by **~4 percentage points** — a meaningful margin on 400K test samples.
+
+### 2. The Conv1D + BiLSTM hybrid is the strongest architecture
+Combining local CNN n-gram features with BiLSTM sequential context gave the  
+best of both worlds: fast convergence (CNN) and long-range understanding (LSTM).
+
+### 3. Batch size was the most critical engineering fix
+The original batch size of **8** produced 315,000 gradient steps per epoch,  
+making training effectively impossible to complete on a GPU.  
+Increasing to **1024** reduced steps/epoch to ~1,000 — a **315× speed-up**.
+
+### 4. Bidirectional encoding matters for sentiment
+Reading reviews both left→right and right→left gave the models access to  
+context that unidirectional RNNs miss (e.g. negations that appear after the sentiment word).
+
+### 5. GlobalMaxPooling outperforms last-hidden-state pooling
+The most sentiment-relevant word in a review can appear anywhere.  
+GlobalMaxPool selects the strongest signal across all timesteps rather  
+than relying on the final RNN state alone.
+
+---
+
+## Hyperparameter Decisions
+
+| Parameter | Value Chosen | Reason |
+|---|---|---|
+| `VOCAB_SIZE` | 50,000 | Covers >95% of word types in the training corpus |
+| `MAX_LEN` | 150 | Captures 93rd-percentile review length; 95th is 161 |
+| `EMBED_DIM` | 128 | Richer representations than 64 with manageable memory cost |
+| `BATCH_SIZE` | 1,024 | GPU-efficient; 8 made training 315× slower |
+| `DL_SAMPLES` | 1.2M | Sufficient signal; tokenising all 3.6M is slow and unnecessary |
+| `LEARNING_RATE` | 3×10⁻⁴ | Lower than default 1×10⁻³ for stable large-batch training |
+
+---
+
+## Deployment
+
+The best model (`Conv1D_BiLSTM`, 94.58% accuracy, AUC 0.986) was deployed as a  
+**FastAPI web service** with a custom dark-themed UI, supporting:
+- **Single review** analysis with confidence score and progress bar  
+- **Batch mode** (up to 50 reviews) with aggregate statistics  
+- **REST API** endpoints (`/api/predict`, `/api/predict/batch`) for programmatic access  
+- Ready for **Hugging Face Spaces** deployment via Docker
+
+---
+
+## Possible Further Improvements
+
+| Idea | Expected Gain |
+|---|---|
+| Pre-trained embeddings (GloVe / FastText) | +0.5–1% accuracy |
+| Fine-tune DistilBERT on this dataset | +2–3% accuracy |
+| Train on the full 3.6M instead of 1.2M sample | +0.5–1% accuracy |
+| Ensemble (average predictions of BiLSTM + BiGRU + Conv1D) | +0.3–0.5% accuracy |
+| Hyperparameter search (Optuna / Keras Tuner) | Marginal gains |
+
